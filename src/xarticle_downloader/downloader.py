@@ -18,6 +18,10 @@ ARTICLE_PATH_RE = re.compile(r"^/i/article/(\d+)$")
 ARTICLE_PATH_IN_TEXT_RE = re.compile(r"/i/article/(\d+)")
 HREF_RE = re.compile(r"""href=["']([^"']+)["']""", flags=re.IGNORECASE)
 URL_RE = re.compile(r"https?://[^\s\"'<>]+", flags=re.IGNORECASE)
+IMG_SRC_RE = re.compile(r"""<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*>""", flags=re.IGNORECASE)
+SOURCE_SRC_RE = re.compile(r"""<source\b[^>]*\bsrc=["']([^"']+)["'][^>]*>""", flags=re.IGNORECASE)
+VIDEO_POSTER_RE = re.compile(r"""<video\b[^>]*\bposter=["']([^"']+)["'][^>]*>""", flags=re.IGNORECASE)
+SRCSET_RE = re.compile(r"""\bsrcset=["']([^"']+)["']""", flags=re.IGNORECASE)
 ID_RE = re.compile(r"^\d{8,}$")
 
 TITLE_KEYS = {
@@ -66,6 +70,31 @@ PUNCT_ASCII_TRANSLATION = str.maketrans(
         "\u00a0": " ",
     }
 )
+
+IMAGE_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".svg",
+    ".avif",
+)
+VIDEO_EXTENSIONS = (
+    ".mp4",
+    ".mov",
+    ".webm",
+    ".m3u8",
+)
+MEDIA_ALT_KEYS = {
+    "alt",
+    "alt_text",
+    "accessibility_label",
+    "description",
+    "title",
+    "name",
+}
 
 
 class XArticleError(RuntimeError):
@@ -375,6 +404,9 @@ def download_article_markdown(
         if not title and headless_title:
             title = headless_title
 
+    if body:
+        body = _inject_html_media_if_missing(body, article_html)
+
     if not title:
         title = f"X Article {article_id}"
     title = _clean_title(title) or f"X Article {article_id}"
@@ -565,6 +597,10 @@ def _extract_article_from_status_graphql(
         body = _extract_body_markdown(article_obj)
     if not body:
         body = _extract_body_markdown(payload)
+    if body:
+        body = _inject_media_if_missing(body, article_obj)
+    if body:
+        body = _inject_media_if_missing(body, payload)
 
     if not _looks_like_article_text(body):
         return article_id, title, None
@@ -962,6 +998,10 @@ def _extract_article_from_payloads(
         body = _extract_body_markdown(article_obj)
     if not body:
         body = _extract_body_markdown(payloads)
+    if body:
+        body = _inject_media_if_missing(body, article_obj)
+    if body:
+        body = _inject_media_if_missing(body, payloads)
 
     return title, body
 
@@ -1041,15 +1081,28 @@ def _find_best_title(node: Any) -> str | None:
 
 
 def _extract_body_markdown(node: Any) -> str | None:
-    plain = _find_best_plain_text(node)
-    if plain and _looks_like_article_text(plain):
-        return _normalize_markdown_text(plain)
-
     rich = _find_rich_text_candidate(node)
     if rich is not None:
         rendered = _render_rich_text_to_markdown(rich)
+        if isinstance(rich, dict) and isinstance(rich.get("blocks"), list):
+            content_state_rendered = _render_content_state_to_markdown(rich)
+            if content_state_rendered and _looks_like_article_text(content_state_rendered):
+                rendered = content_state_rendered
         if _looks_like_article_text(rendered):
-            return _normalize_markdown_text(rendered)
+            rich_markdown = _normalize_markdown_text(rendered)
+            plain = _find_best_plain_text(node)
+            if plain and _looks_like_article_text(plain):
+                plain_markdown = _normalize_markdown_text(plain)
+                if _markdown_contains_media(rich_markdown):
+                    return rich_markdown
+                if len(rich_markdown) >= int(len(plain_markdown) * 0.65):
+                    return rich_markdown
+                return plain_markdown
+            return rich_markdown
+
+    plain = _find_best_plain_text(node)
+    if plain and _looks_like_article_text(plain):
+        return _normalize_markdown_text(plain)
     return None
 
 
@@ -1139,6 +1192,11 @@ def _render_rich_node(node: Any) -> str:
     url = node.get("url") or node.get("href")
     if isinstance(url, str) and url and content:
         content = f"[{content}]({url})"
+
+    if node_type in {"image", "img", "photo", "media", "video", "gif"}:
+        media = _render_media_node_to_markdown(node, entity_type=node_type)
+        if media:
+            return media
 
     if node_type in {"h1", "heading1"}:
         return f"# {content}".strip()
@@ -1247,20 +1305,22 @@ def _apply_draft_entity_ranges(text: str, entity_ranges: Any, entity_map: Any) -
 
 def _render_draft_atomic_block(block: dict[str, Any], entity_map: Any) -> str | None:
     entity_ranges = block.get("entityRanges")
-    if not isinstance(entity_ranges, list) or not entity_ranges:
-        return None
-    first = entity_ranges[0]
-    if not isinstance(first, dict):
-        return None
-    entity = _get_draft_entity(entity_map, first.get("key"))
-    if not isinstance(entity, dict):
-        return None
-    data = entity.get("data")
-    if not isinstance(data, dict):
-        return None
-    url = data.get("url") or data.get("expanded_url") or data.get("href")
-    if isinstance(url, str) and url:
-        return url
+    if isinstance(entity_ranges, list):
+        for item in entity_ranges:
+            if not isinstance(item, dict):
+                continue
+            entity = _get_draft_entity(entity_map, item.get("key"))
+            if not isinstance(entity, dict):
+                continue
+            rendered = _render_media_node_to_markdown(entity, entity_type=str(entity.get("type") or ""))
+            if rendered:
+                return rendered
+
+    block_data = block.get("data")
+    if isinstance(block_data, dict):
+        rendered = _render_media_node_to_markdown(block_data)
+        if rendered:
+            return rendered
     return None
 
 
@@ -1280,6 +1340,335 @@ def _get_draft_entity(entity_map: Any, key: Any) -> dict[str, Any] | None:
         if isinstance(value, dict):
             return value
     return None
+
+
+def _render_media_node_to_markdown(node: Any, entity_type: str = "") -> str | None:
+    image_url = _pick_best_media_url(node, kind="image")
+    if image_url:
+        alt = _extract_media_alt_text(node, default="image")
+        return f"![{alt}]({image_url})"
+
+    video_url = _pick_best_media_url(node, kind="video")
+    if video_url:
+        label = "video"
+        if "gif" in entity_type.lower():
+            label = "gif"
+        return f"[{label}]({video_url})"
+
+    link_url = _pick_best_media_url(node, kind="link")
+    if link_url:
+        return link_url
+    return None
+
+
+def _inject_media_if_missing(body: str | None, node: Any) -> str | None:
+    if not body:
+        return body
+    if _markdown_contains_media(body):
+        return body
+    urls = _extract_embedded_media_urls(node)
+    return _inject_media_from_urls(body, urls)
+
+
+def _inject_html_media_if_missing(body: str | None, html_text: str) -> str | None:
+    if not body:
+        return body
+    if _markdown_contains_media(body):
+        return body
+    urls = _extract_media_urls_from_html(html_text)
+    return _inject_media_from_urls(body, urls)
+
+
+def _inject_media_from_urls(body: str, urls: list[str]) -> str:
+    if not urls:
+        return body
+    lines: list[str] = []
+    seen_lines: set[str] = set()
+    for url in urls:
+        if _looks_like_image_url(url):
+            line = f"![image]({url})"
+            if line not in seen_lines:
+                lines.append(line)
+                seen_lines.add(line)
+        elif _looks_like_video_url(url):
+            line = f"[video]({url})"
+            if line not in seen_lines:
+                lines.append(line)
+                seen_lines.add(line)
+    if not lines:
+        return body
+    return _inject_media_lines_inline(body, lines)
+
+
+def _inject_media_lines_inline(body: str, media_lines: list[str]) -> str:
+    blocks = [chunk.strip() for chunk in re.split(r"\n{2,}", body.strip()) if chunk.strip()]
+    if not blocks:
+        return body
+    if not media_lines:
+        return body
+
+    if len(blocks) == 1:
+        media_section = "\n\n".join(media_lines)
+        return f"{body.rstrip()}\n\n## Media\n\n{media_section}"
+
+    candidate_indices = [
+        idx
+        for idx, block in enumerate(blocks)
+        if not (
+            block.startswith("#")
+            or block.startswith("> ")
+            or block.startswith("```")
+            or re.match(r"^(?:- |\d+\. )", block)
+        )
+    ]
+    if not candidate_indices:
+        candidate_indices = list(range(len(blocks)))
+
+    insertion_map: dict[int, list[str]] = {}
+    slots = len(candidate_indices)
+    count = len(media_lines)
+    for i, line in enumerate(media_lines):
+        raw_index = int(((i + 1) * slots) / (count + 1))
+        chosen = candidate_indices[min(raw_index, slots - 1)]
+        insertion_map.setdefault(chosen, []).append(line)
+
+    out: list[str] = []
+    for idx, block in enumerate(blocks):
+        out.append(block)
+        if idx in insertion_map:
+            out.extend(insertion_map[idx])
+    return "\n\n".join(out).strip()
+
+
+def _extract_embedded_media_urls(node: Any, max_items: int = 10) -> list[str]:
+    if node is None:
+        return []
+    candidates: list[str] = []
+    for path, value in _iter_keyed_values(node):
+        if not isinstance(value, str):
+            continue
+        url = value.strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        if not (_looks_like_image_url(url) or _looks_like_video_url(url)):
+            continue
+        score = _score_embedded_media_path(path, url)
+        if score > 0:
+            candidates.append(url)
+    if not candidates:
+        return []
+    seen: set[str] = set()
+    results: list[str] = []
+    for url in candidates:
+        if url in seen:
+            continue
+        seen.add(url)
+        results.append(url)
+        if len(results) >= max_items:
+            break
+    return results
+
+
+def _extract_media_urls_from_html(html_text: str, max_items: int = 10) -> list[str]:
+    if not html_text:
+        return []
+
+    raw_values: list[str] = []
+    for pattern in (IMG_SRC_RE, SOURCE_SRC_RE, VIDEO_POSTER_RE):
+        raw_values.extend(match.group(1) for match in pattern.finditer(html_text))
+    for match in SRCSET_RE.finditer(html_text):
+        srcset = match.group(1)
+        for part in srcset.split(","):
+            token = part.strip().split(" ", 1)[0]
+            if token:
+                raw_values.append(token)
+
+    candidates: list[str] = []
+    for raw in raw_values:
+        url = _normalize_extracted_url(raw)
+        if not url:
+            continue
+        if not (_looks_like_image_url(url) or _looks_like_video_url(url)):
+            continue
+        score = _score_embedded_media_path(("html", "tag", "src"), url)
+        if score > 0:
+            candidates.append(url)
+    seen: set[str] = set()
+    results: list[str] = []
+    for url in candidates:
+        if url in seen:
+            continue
+        seen.add(url)
+        results.append(url)
+        if len(results) >= max_items:
+            break
+    return results
+
+
+def _normalize_extracted_url(raw: str) -> str | None:
+    value = html.unescape(raw).strip().strip("'\"")
+    if not value:
+        return None
+    value = value.replace("\\/", "/")
+    if value.startswith("//"):
+        value = f"https:{value}"
+    if not value.startswith(("http://", "https://")):
+        return None
+    return value
+
+
+def _score_embedded_media_path(path: tuple[str, ...], url: str) -> int:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    pth = parsed.path.lower()
+    leaf = path[-1] if path else ""
+    score = 0
+
+    if _looks_like_image_url(url):
+        score += 8
+    if _looks_like_video_url(url):
+        score += 8
+    if "pbs.twimg.com" in host and "/media/" in pth:
+        score += 10
+    if "video.twimg.com" in host:
+        score += 10
+    if any(token in leaf for token in ("media", "image", "photo", "thumb", "video", "original")):
+        score += 6
+    if any(token in pth for token in ("/profile_images/", "/emoji/", "/hashflags/")):
+        score -= 12
+    return score
+
+
+def _pick_best_media_url(node: Any, kind: str) -> str | None:
+    candidates: list[tuple[int, str]] = []
+    for path, value in _iter_keyed_values(node):
+        if not isinstance(value, str):
+            continue
+        url = value.strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        score = _score_media_url_candidate(path, url, kind)
+        if score > 0:
+            candidates.append((score, url))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _score_media_url_candidate(path: tuple[str, ...], url: str, kind: str) -> int:
+    leaf = path[-1] if path else ""
+    url_lower = url.lower()
+    host = urllib.parse.urlparse(url).netloc.lower()
+    path_lower = urllib.parse.urlparse(url).path.lower()
+
+    if kind == "image":
+        score = 0
+        if _looks_like_image_url(url):
+            score += 10
+        if leaf in {
+            "media_url_https",
+            "media_url",
+            "image_url",
+            "image",
+            "original_img_url",
+            "original_image_url",
+            "thumbnail_url",
+            "thumb_url",
+            "preview_image_url",
+        }:
+            score += 10
+        if any(token in leaf for token in ("image", "photo", "thumb", "media_url")):
+            score += 5
+        if "pbs.twimg.com/media/" in url_lower:
+            score += 10
+        if "twimg.com" in host:
+            score += 2
+        if any(token in path_lower for token in ("/profile_images/", "/emoji/")):
+            score -= 8
+        return score
+
+    if kind == "video":
+        score = 0
+        if _looks_like_video_url(url):
+            score += 10
+        if leaf in {"video_url", "stream_url", "playback_url"}:
+            score += 8
+        if any(token in leaf for token in ("video", "playback", "stream")):
+            score += 5
+        if "video.twimg.com" in host:
+            score += 6
+        return score
+
+    score = 0
+    if leaf in {"url", "expanded_url", "href", "src"}:
+        score += 5
+    if "x.com/" in url_lower or "twitter.com/" in url_lower:
+        score += 2
+    return score
+
+
+def _looks_like_image_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = parsed.netloc.lower()
+    lower_url = url.lower()
+    lower_path = parsed.path.lower()
+    if any(token in lower_path for token in ("/profile_images/", "/emoji/", "/hashflags/")):
+        return False
+    if lower_path.endswith(IMAGE_EXTENSIONS):
+        return True
+    if "pbs.twimg.com/media/" in lower_url:
+        return True
+    if host == "pbs.twimg.com" and any(
+        token in lower_path
+        for token in ("/card_img/", "/amplify_video_thumb/", "/tweet_video_thumb/", "/ext_tw_video_thumb/")
+    ):
+        return True
+    if "twimg.com" in host and (
+        "/media/" in lower_path
+        or "/card_img/" in lower_path
+        or "/amplify_video_thumb/" in lower_path
+        or "/tweet_video_thumb/" in lower_path
+        or "/ext_tw_video_thumb/" in lower_path
+    ):
+        return True
+    if "twimg.com" in host and "format=" in parsed.query.lower():
+        return True
+    return False
+
+
+def _looks_like_video_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if path.endswith(VIDEO_EXTENSIONS):
+        return True
+    if host == "video.twimg.com" or host.endswith(".video.twimg.com"):
+        return True
+    return False
+
+
+def _extract_media_alt_text(node: Any, default: str) -> str:
+    candidates: list[str] = []
+    for path, value in _iter_keyed_values(node):
+        if not isinstance(value, str):
+            continue
+        if path and path[-1] in MEDIA_ALT_KEYS:
+            text = re.sub(r"\s+", " ", value).strip()
+            if text:
+                candidates.append(text)
+    if candidates:
+        best = max(candidates, key=len)
+        return best[:120].strip()
+    return default
+
+
+def _markdown_contains_media(text: str) -> bool:
+    return bool(re.search(r"!\[[^\]]*]\(https?://[^)]+\)", text))
 
 
 def _extract_markdown_from_html(html_text: str) -> str:

@@ -9,6 +9,8 @@ CLI tool to download a public X.com Article and save it as Markdown.
   - `https://x.com/i/article/<article_id>`
 - No login, cookies, OAuth, or API keys required.
 - By default it uses only HTTPS requests + HTML/JSON parsing.
+- Preserves inline media when available in rich content extraction.
+- If inline media is missing, it falls back to media URLs discovered in payloads/HTML and injects them into the body in order.
 - Optional headless fallback exists behind `--use-headless`.
 
 ## Install
@@ -41,4 +43,5 @@ Options:
 - For status URLs, the tool resolves the linked article ID first, then downloads the article.
 - For status URLs, it also uses a public guest-token GraphQL fallback to retrieve article rich text when article HTML is script-blocked.
 - For direct `/i/article/<id>` URLs, extraction depends on public HTML/JSON visibility; if blocked, use `--use-headless` as last resort.
+- Media placement is best-effort when fallback extraction is used, because public payloads do not always include explicit text anchors for each media item.
 - Default filename is generated from article title + article ID.
